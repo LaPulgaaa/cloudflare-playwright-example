@@ -67,13 +67,16 @@ export default {
       browser = await launch(env.MYBROWSER);
       const page = await browser.newPage();
 
-      // Navigate to the Notion page
-      await page.goto(notionUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+      // Navigate to the Notion page and wait for network to be mostly idle
+      await page.goto(notionUrl, { waitUntil: 'networkidle', timeout: 60000 });
 
       // Wait for Notion content to load
-      await page.waitForSelector('[data-content-editable-root="true"]', { timeout: 5000 });
+      await page.waitForSelector('[data-content-editable-root="true"]', { timeout: 10000 });
 
-      // Expand all collapsed content blocks (toggles) - optimized for speed
+      // Give Notion time to render toggles after initial load
+      await page.waitForTimeout(1000);
+
+      // Expand all collapsed content blocks (toggles)
       try {
         const toggleSelector = '.layout [role="button"][aria-expanded="false"]';
 
@@ -100,27 +103,30 @@ export default {
           }, toggleSelector);
         };
 
-        // Click all toggles in batches with shorter waits
+        // Click all toggles in batches with adequate waits for content to load
         let iteration = 0;
-        const maxIterations = 20; // Reduced from 100
+        const maxIterations = 20;
         let lastClickCount = -1;
 
         while (iteration < maxIterations) {
           const clickedCount = await clickAllCollapsed();
 
-          // Early exit if no toggles were clicked or same as last time
-          if (clickedCount === 0 || clickedCount === lastClickCount) break;
+          // Early exit if same as last time (but not on first iteration)
+          if (iteration > 0 && clickedCount === lastClickCount) break;
+
+          // If no toggles found and we've tried a few times, exit
+          if (clickedCount === 0 && iteration > 2) break;
 
           lastClickCount = clickedCount;
-          await page.waitForTimeout(100); // Reduced from 500ms
+          await page.waitForTimeout(300); // Wait for toggles to expand and content to load
           iteration++;
         }
       } catch (error) {
         console.log('Could not expand collapsed content:', error);
       }
 
-      // Shorter final wait for content to settle
-      await page.waitForTimeout(500); // Reduced from 2000ms
+      // Wait for all expanded content to fully render
+      await page.waitForTimeout(1500);
 
       // Extract the page content - text only, no images/links/embeds
       const extractedData = await page.evaluate(() => {
@@ -135,45 +141,34 @@ export default {
           return { title, content: '' };
         }
 
-        // Extract text content from all blocks, excluding images and other media
-        const allBlocks = Array.from(contentRoot.querySelectorAll('[data-block-id]'));
+        // Helper function to extract only direct text from an element, excluding nested blocks
+        const getDirectText = (element: HTMLElement): string => {
+          const clone = element.cloneNode(true) as HTMLElement;
 
-        // Filter to only top-level blocks (not nested inside other blocks)
-        // This prevents duplicate content from nested blocks
-        const topLevelBlocks = allBlocks.filter((block) => {
-          // Check if this block is nested inside another block
-          const parent = block.parentElement?.closest('[data-block-id]');
-          // Only include if no parent block exists in our list
-          return !parent || !allBlocks.includes(parent);
-        });
+          // Remove all nested blocks to get only direct text
+          clone.querySelectorAll('[data-block-id]').forEach(el => el.remove());
 
-        const contentParts: string[] = [];
-
-        topLevelBlocks.forEach((block) => {
-          const blockElement = block as HTMLElement;
-
-          // Skip image blocks, embed blocks, and other non-text content
-          if (
-            blockElement.querySelector('img') ||
-            blockElement.querySelector('[class*="image"]') ||
-            blockElement.querySelector('[class*="embed"]') ||
-            blockElement.querySelector('[class*="video"]') ||
-            blockElement.querySelector('[class*="file"]') ||
-            blockElement.querySelector('svg')
-          ) {
-            return;
-          }
-
-          // Clone the block to manipulate it without affecting the page
-          const clone = blockElement.cloneNode(true) as HTMLElement;
-
-          // Remove any remaining images, links, or media elements
+          // Remove media elements
           clone.querySelectorAll('img, svg, video, audio, iframe').forEach(el => el.remove());
 
-          // Get pure text content
-          const text = clone.textContent?.trim();
+          return clone.textContent?.trim() || '';
+        };
 
-          if (text && text.length > 0) {
+        // Extract text content from all blocks, excluding images and other media
+        const allBlocks = Array.from(contentRoot.querySelectorAll('[data-block-id]'));
+        const contentParts: string[] = [];
+        const seenTexts = new Set<string>(); // Deduplicate identical text
+
+        allBlocks.forEach((block) => {
+          const blockElement = block as HTMLElement;
+
+          // Get only the direct text of this block (not nested blocks)
+          // getDirectText already removes nested blocks and media elements
+          const text = getDirectText(blockElement);
+
+          // Add to content if not empty and not already seen
+          if (text.length > 0 && !seenTexts.has(text)) {
+            seenTexts.add(text);
             contentParts.push(text);
           }
         });
