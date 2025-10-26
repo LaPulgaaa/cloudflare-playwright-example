@@ -49,7 +49,7 @@ export default {
     }
 
     // Validate that it's a Notion URL
-    if (!notionUrl.includes('notion.so') || !notionUrl.includes('notion.site')) {
+    if (!notionUrl.includes('notion.so') && !notionUrl.includes('notion.site')) {
       return new Response(
         JSON.stringify({ error: 'Invalid Notion URL. Must be from notion.so or notion.site' }),
         {
