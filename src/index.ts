@@ -1,78 +1,187 @@
-import fs from 'fs';
-
 import { launch } from '@cloudflare/playwright';
-import { expect } from '@cloudflare/playwright/test';
 
 const CORS_HEADERS = {
-  'Access-Control-Allow-Origin': 'https://trace.playwright.dev',
-  'Access-Control-Allow-Methods': 'GET',
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
+interface NotionContent {
+  title: string;
+  content: string;
+  error?: string;
+}
+
 export default {
-  async fetch(request: Request, env: Env) {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    
-    if (url.pathname !== '/') {
-      return new Response(null, { status: 404 });
+
+    if (url.pathname !== '/scrape') {
+      return new Response(
+        JSON.stringify({ error: 'Use /scrape endpoint with ?url=<notion-url>' }),
+        {
+          status: 404,
+          headers: {
+            'Content-Type': 'application/json',
+            ...CORS_HEADERS,
+          }
+        }
+      );
     }
 
     if (request.method === 'OPTIONS') {
       return new Response(null, { headers: CORS_HEADERS });
     }
-    
-    const trace = url.searchParams.has('trace') || request.headers.get('referer') === 'https://trace.playwright.dev/';
-    const todos = url.searchParams.getAll('todo');    
-    
-    const browser = await launch(env.MYBROWSER);
-    const page = await browser.newPage();
-    
-    if (trace)
-      await page.context().tracing.start({ screenshots: true, snapshots: true });
 
-    await page.goto('https://demo.playwright.dev/todomvc');
+    const notionUrl = url.searchParams.get('url');
 
-    const TODO_ITEMS = todos.length > 0 ? todos : [
-      'buy some cheese',
-      'feed the cat',
-      'book a doctors appointment'
-    ];
-
-    const newTodo = page.getByPlaceholder('What needs to be done?');
-    for (const item of TODO_ITEMS) {
-      await newTodo.fill(item);
-      await newTodo.press('Enter');
+    if (!notionUrl) {
+      return new Response(
+        JSON.stringify({ error: 'Missing "url" query parameter' }),
+        {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json',
+            ...CORS_HEADERS,
+          }
+        }
+      );
     }
 
-    await expect(page.getByTestId('todo-title')).toHaveCount(TODO_ITEMS.length);
+    // Validate that it's a Notion URL
+    if (!notionUrl.includes('notion.so') || !notionUrl.includes('notion.site')) {
+      return new Response(
+        JSON.stringify({ error: 'Invalid Notion URL. Must be from notion.so or notion.site' }),
+        {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json',
+            ...CORS_HEADERS,
+          }
+        }
+      );
+    }
 
-    await Promise.all(TODO_ITEMS.map(
-        (value, index) => expect(page.getByTestId('todo-title').nth(index)).toHaveText(value)
-    ));
+    let browser;
+    try {
+      browser = await launch(env.MYBROWSER);
+      const page = await browser.newPage();
 
-    if (trace) {
-      // we must write the trace to /tmp as it is the only directory 
-      // that is writable in the worker
-      await page.context().tracing.stop({ path: '/tmp/trace.zip' });
+      // Navigate to the Notion page
+      await page.goto(notionUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+      // Wait for Notion content to load
+      await page.waitForSelector('[data-content-editable-root="true"]', { timeout: 10000 });
+
+      // Expand all collapsed content blocks (toggles)
+      try {
+        const toggleSelector = '.layout [role="button"][aria-expanded="false"]';
+
+        const getCollapsedCount = async () =>
+          await page.evaluate((sel) => document.querySelectorAll(sel).length, toggleSelector);
+
+        const clickFirstCollapsed = async () => {
+          return await page.evaluate((sel) => {
+            const nodes = Array.from(document.querySelectorAll(sel));
+            for (const node of nodes) {
+              if (!node || !node.isConnected) continue;
+              const rect = node.getBoundingClientRect();
+              const visible =
+                rect.width > 1 && rect.height > 1 && rect.bottom > 0 && rect.right > 0;
+              if (!visible) continue;
+              const disabled = node.getAttribute('aria-disabled') === 'true';
+              if (disabled) continue;
+              (node as HTMLElement).scrollIntoView({
+                block: 'center',
+                inline: 'center',
+                behavior: 'auto',
+              });
+              node.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            }
+          }, toggleSelector);
+        };
+
+        let iteration = 0;
+        const maxIterations = 100;
+        while (iteration < maxIterations) {
+          const before = await getCollapsedCount();
+          if (before === 0) break;
+          await clickFirstCollapsed();
+          await page.waitForTimeout(500); // Wait for content to expand
+          iteration++;
+        }
+      } catch (error) {
+        console.log('Could not expand collapsed content:', error);
+      }
+
+      // Wait a bit for all content to be fully loaded after expanding
+      await page.waitForTimeout(2000);
+
+      // Extract the page content
+      const extractedData = await page.evaluate(() => {
+        // Get the title
+        const titleElement = document.querySelector('.notion-page-content .notion-header__title, [data-content-editable-leaf="true"]');
+        const title = titleElement?.textContent?.trim() || 'Untitled';
+
+        // Get all text content from the page
+        const contentRoot = document.querySelector('[data-content-editable-root="true"]');
+
+        if (!contentRoot) {
+          return { title, content: '' };
+        }
+
+        // Extract text content from all blocks
+        const blocks = Array.from(contentRoot.querySelectorAll('[data-block-id]'));
+        const contentParts: string[] = [];
+
+        blocks.forEach((block) => {
+          const text = block.textContent?.trim();
+          if (text && text.length > 0) {
+            contentParts.push(text);
+          }
+        });
+
+        return {
+          title,
+          content: contentParts.join('\n\n'),
+        };
+      });
+
       await browser.close();
-      const file = await fs.promises.readFile('/tmp/trace.zip');
 
-      return new Response(new Uint8Array(file), {
+      const result: NotionContent = {
+        title: extractedData.title,
+        content: extractedData.content,
+      };
+
+      return new Response(JSON.stringify(result, null, 2), {
         status: 200,
         headers: {
-          'Content-Type': 'application/zip',
+          'Content-Type': 'application/json',
           ...CORS_HEADERS,
         },
       });
-    } else {
-      const img = await page.screenshot();
-      await browser.close();
 
-      return new Response(new Uint8Array(img), {
-        headers: {
-          'Content-Type': 'image/png',
-        },
-      });
+    } catch (error) {
+      if (browser) {
+        await browser.close();
+      }
+
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
+
+      return new Response(
+        JSON.stringify({
+          error: 'Failed to scrape Notion page',
+          details: errorMessage
+        }),
+        {
+          status: 500,
+          headers: {
+            'Content-Type': 'application/json',
+            ...CORS_HEADERS,
+          }
+        }
+      );
     }
   },
 };
